@@ -1,4 +1,4 @@
-import sys
+
 from pathlib import Path
 
 import duckdb
@@ -8,569 +8,682 @@ import streamlit as st
 
 
 
-# 1. PROJECT CONFIGURATION
-
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
 st.set_page_config(
-    page_title="FleetSense Analytics",
+    page_title="FleetSense 2025 Analytics",
     page_icon="🚕",
     layout="wide"
 )
 
-st.title("🚕 FleetSense | NYC Taxi Analytics")
-st.caption("2025 NYC Yellow Taxi Trip Records | Interactive Dashboard")
-
-
-# 2. DATABASE CONNECTION
-
-@st.cache_resource
-def get_connection():
-
-    database_files = list(PROJECT_ROOT.glob("data/**/*.duckdb"))
-    database_files += list(PROJECT_ROOT.glob("data/**/*.db"))
-
-    for db_path in database_files:
-        try:
-            connection = duckdb.connect(
-                str(db_path),
-                read_only=True
-            )
-
-            tables = connection.execute(
-                "SHOW TABLES"
-            ).df()["name"].tolist()
-
-            if "trips" in tables:
-                return connection, db_path
-
-            connection.close()
-
-        except Exception:
-            continue
-
-    return None, None
-
-
-con, database_path = get_connection()
-
-if con is None:
-    st.error("DuckDB database or trips table not found.")
-
-    st.code(
-        "python -m pipeline.ingest\n"
-        "python -m pipeline.build"
-    )
-
-    st.stop()
-
-
-
-# 3. DETECT ACTUAL DATABASE COLUMNS
-
-
-schema = con.execute("DESCRIBE trips").df()
-
-available_columns = schema["column_name"].tolist()
-
-
-def find_column(possible_names):
-
-    for name in possible_names:
-        if name in available_columns:
-            return name
-
-    return None
-
-
-pickup_date_col = find_column([
-    "pickup_datetime",
-    "tpep_pickup_datetime"
-])
-
-pickup_zone_col = find_column([
-    "pickup_location_id",
-    "PULocationID"
-])
-
-dropoff_zone_col = find_column([
-    "dropoff_location_id",
-    "DOLocationID"
-])
-
-total_col = find_column([
-    "total_amount"
-])
-
-fare_col = find_column([
-    "fare_amount"
-])
-
-distance_col = find_column([
-    "trip_distance"
-])
-
-if not pickup_date_col or not total_col:
-    st.error("Required columns are missing from the trips table.")
-    st.dataframe(schema, width="stretch")
-    st.stop()
-
-
-
-# 4. SIDEBAR FILTERS
-
-
-st.sidebar.title("🎛️ Dashboard Filters")
-
-st.sidebar.success("Database connected")
-
-with st.sidebar.expander("Database details"):
-    st.write("Database:", database_path.name)
-    st.write("Table: trips")
-    st.write("Available columns:", available_columns)
-
-
-minimum_date, maximum_date = con.execute(
-    f"""
-    SELECT
-        MIN(CAST("{pickup_date_col}" AS DATE)),
-        MAX(CAST("{pickup_date_col}" AS DATE))
-    FROM trips
-    """
-).fetchone()
-
-
-if minimum_date is None:
-    st.warning("No trip data available.")
-    st.stop()
-
-
-selected_dates = st.sidebar.date_input(
-    "Select date range",
-    value=(minimum_date, maximum_date),
-    min_value=minimum_date,
-    max_value=maximum_date
+st.title("🚕 FleetSense 2025 - NYC Taxi Analytics Dashboard")
+st.markdown(
+    "Full-year analysis of NYC Yellow Taxi trips | January–December 2025"
 )
 
 
-# IMPORTANT: Convert selected dates into two
-# individual values before passing them to DuckDB.
+# =========================================================
+# 2. DATABASE CONNECTION
+# =========================================================
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+DB_PATH = BASE_DIR / "data" / "fleetsense_full_year.duckdb"
+
+if not DB_PATH.exists():
+    st.error(f"Database not found: {DB_PATH}")
+    st.info("Please run main.py first.")
+    st.stop()
+
+
+@st.cache_resource
+def get_connection():
+    return duckdb.connect(str(DB_PATH), read_only=True)
+
+
+con = get_connection()
+
+
+# =========================================================
+# 3. CHECK DATABASE TABLE
+# =========================================================
+
+try:
+    table_check = con.execute("""
+        SELECT COUNT(*)
+        FROM information_schema.tables
+        WHERE table_name = 'trips'
+    """).fetchone()[0]
+
+    if table_check == 0:
+        st.error("Trips table not found in database.")
+        st.stop()
+
+    columns = [
+        row[0]
+        for row in con.execute("DESCRIBE trips").fetchall()
+    ]
+
+except Exception as e:
+    st.error(f"Database error: {e}")
+    st.stop()
+
+
+required_columns = [
+    "tpep_pickup_datetime",
+    "trip_category"
+]
+
+missing_columns = [
+    col for col in required_columns if col not in columns
+]
+
+if missing_columns:
+    st.error(f"Missing columns: {missing_columns}")
+    st.stop()
+
+
+# =========================================================
+# 4. HELPER FUNCTION
+# =========================================================
+
+def query_df(sql, params=None):
+    if params is None:
+        params = []
+
+    return con.execute(sql, params).df()
+
+
+# =========================================================
+# 5. DATE RANGE
+# =========================================================
+
+date_info = query_df("""
+    SELECT
+        MIN(CAST(tpep_pickup_datetime AS DATE)) AS min_date,
+        MAX(CAST(tpep_pickup_datetime AS DATE)) AS max_date
+    FROM trips
+    WHERE tpep_pickup_datetime IS NOT NULL
+      AND CAST(tpep_pickup_datetime AS DATE)
+          BETWEEN DATE '2025-01-01' AND DATE '2025-12-31'
+""")
+
+if date_info.empty or pd.isna(date_info.iloc[0]["min_date"]):
+    st.error("No 2025 trip records found in the database.")
+    st.stop()
+
+db_min_date = pd.Timestamp(date_info.iloc[0]["min_date"]).date()
+db_max_date = pd.Timestamp(date_info.iloc[0]["max_date"]).date()
+
+year_start = pd.Timestamp("2025-01-01").date()
+year_end = pd.Timestamp("2025-12-31").date()
+
+
+# =========================================================
+# 6. SIDEBAR FILTERS
+# =========================================================
+
+st.sidebar.title("📊 Dashboard Filters")
+
+st.sidebar.caption("Default selection: Full year 2025")
+
+selected_dates = st.sidebar.date_input(
+    "Select Date Range",
+    value=(year_start, year_end),
+    min_value=year_start,
+    max_value=year_end
+)
 
 if isinstance(selected_dates, (tuple, list)):
-
     if len(selected_dates) == 2:
-        start_date = selected_dates[0]
-        end_date = selected_dates[1]
-
+        start_date, end_date = selected_dates
     elif len(selected_dates) == 1:
         start_date = selected_dates[0]
         end_date = selected_dates[0]
-
     else:
-        start_date = minimum_date
-        end_date = maximum_date
-
+        start_date, end_date = year_start, year_end
 else:
     start_date = selected_dates
     end_date = selected_dates
 
+# Keep the selected date range within available 2025 data.
+start_date = max(start_date, db_min_date)
+end_date = min(end_date, db_max_date)
 
-date_filter = f"""
-CAST("{pickup_date_col}" AS DATE)
-BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+if start_date > end_date:
+    st.warning("Please select a valid date range.")
+    st.stop()
+
+airport_filter = st.sidebar.selectbox(
+    "Airport Classification",
+    [
+        "All Trips",
+        "Airport Trips",
+        "Non-Airport Trips"
+    ],
+    index=0
+)
+
+
+# =========================================================
+# 7. FILTER CONDITIONS
+# =========================================================
+
+where_clause = """
+    CAST(tpep_pickup_datetime AS DATE) BETWEEN ? AND ?
+    AND CAST(tpep_pickup_datetime AS DATE)
+        BETWEEN DATE '2025-01-01' AND DATE '2025-12-31'
 """
 
-params = [
-    str(start_date),
-    str(end_date)
-]
+params = [start_date, end_date]
+
+if airport_filter == "Airport Trips":
+    where_clause += " AND trip_category = ?"
+    params.append("Airport Trip")
+
+elif airport_filter == "Non-Airport Trips":
+    where_clause += " AND trip_category = ?"
+    params.append("Non-Airport Trip")
 
 
+# =========================================================
+# 8. AIRPORT VS NON-AIRPORT SUMMARY
+# =========================================================
 
-# 5. KPI CARDS
+st.markdown("---")
+st.subheader("✈️ Airport vs Non-Airport Trip Summary")
 
+summary = query_df(
+    f"""
+    SELECT
+        trip_category,
+        COUNT(*) AS total_trips,
+        ROUND(COALESCE(SUM(revenue), 0), 2) AS total_revenue,
+        ROUND(COALESCE(AVG(fare_amount), 0), 2) AS average_fare,
+        ROUND(COALESCE(AVG(duration_minutes), 0), 2) AS average_duration
+    FROM trips
+    WHERE {where_clause}
+    GROUP BY trip_category
+    ORDER BY trip_category
+    """,
+    params
+)
+
+if summary.empty:
+    st.warning("No trips found for selected filters.")
+    st.stop()
+
+
+# =========================================================
+# 9. KPI METRICS
+# =========================================================
+
+total_trips = int(summary["total_trips"].sum())
+total_revenue = float(summary["total_revenue"].sum())
+
+average_fare = query_df(
+    f"""
+    SELECT COALESCE(AVG(fare_amount), 0)
+    FROM trips
+    WHERE {where_clause}
+    """,
+    params
+).iloc[0, 0]
+
+average_duration = query_df(
+    f"""
+    SELECT COALESCE(AVG(duration_minutes), 0)
+    FROM trips
+    WHERE {where_clause}
+    """,
+    params
+).iloc[0, 0]
 
 st.subheader("📌 Key Performance Indicators")
 
-kpi_fields = [
-    f'COUNT(*) AS total_trips',
-    f'SUM("{total_col}") AS total_revenue'
-]
-
-if fare_col:
-    kpi_fields.append(
-        f'AVG("{fare_col}") AS average_fare'
-    )
-
-if distance_col:
-    kpi_fields.append(
-        f'AVG("{distance_col}") AS average_distance'
-    )
-
-
-kpi_sql = f"""
-SELECT
-    {", ".join(kpi_fields)}
-FROM trips
-WHERE {date_filter}
-"""
-
-kpi = con.execute(
-    kpi_sql,
-    params
-).df().iloc[0]
-
-
 c1, c2, c3, c4 = st.columns(4)
 
-c1.metric(
-    "🚕 Total Trips",
-    f"{int(kpi['total_trips']):,}"
+c1.metric("Total Trips", f"{total_trips:,}")
+c2.metric("Total Revenue", f"${total_revenue:,.2f}")
+c3.metric("Average Fare", f"${float(average_fare):,.2f}")
+c4.metric("Average Duration", f"{float(average_duration):.2f} min")
+
+st.caption(f"Selected period: {start_date} to {end_date}")
+
+
+# =========================================================
+# 10. AIRPORT VS NON-AIRPORT CHART
+# =========================================================
+
+fig = px.bar(
+    summary,
+    x="trip_category",
+    y="total_trips",
+    color="trip_category",
+    title="Airport vs Non-Airport Trip Count",
+    text="total_trips",
+    barmode="group"
 )
 
-c2.metric(
-    "💰 Total Revenue",
-    f"${(kpi['total_revenue'] or 0):,.2f}"
-)
-
-if fare_col:
-    c3.metric(
-        "💵 Average Fare",
-        f"${(kpi['average_fare'] or 0):,.2f}"
-    )
-else:
-    c3.metric("Average Fare", "N/A")
-
-if distance_col:
-    c4.metric(
-        "📏 Average Distance",
-        f"{(kpi['average_distance'] or 0):,.2f} miles"
-    )
-else:
-    c4.metric("Average Distance", "N/A")
-
-
-st.divider()
-
-
-
-# 6. MONTHLY LINE CHART
-
-
-st.subheader("📈 Monthly Trip Trends")
-
-monthly = con.execute(
-    f"""
-    SELECT
-        strftime("{pickup_date_col}", '%Y-%m') AS month,
-        COUNT(*) AS trips,
-        SUM("{total_col}") AS revenue
-    FROM trips
-    WHERE {date_filter}
-    GROUP BY 1
-    ORDER BY 1
-    """,
-    params
-).df()
-
-
-if not monthly.empty:
-
-    fig = px.line(
-        monthly,
-        x="month",
-        y="trips",
-        markers=True,
-        title="Monthly Number of Trips",
-        labels={
-            "month": "Month",
-            "trips": "Total Trips"
-        },
-        template="plotly_white"
-    )
-
-    fig.update_layout(
-        hovermode="x unified"
-    )
-
-    st.plotly_chart(
-        fig,
-        width="stretch"
-    )
-
-    st.markdown("**Monthly Summary Table**")
-
-    st.dataframe(
-        monthly,
-        width="stretch",
-        hide_index=True
-    )
-
-
-st.divider()
-
-
-
-# 7. TOP 10 PICKUP LOCATIONS - BAR CHART
-
-
-st.subheader("📊 Top 10 Pickup Locations")
-
-if pickup_zone_col:
-
-    zone_data = con.execute(
-        f"""
-        SELECT
-            "{pickup_zone_col}" AS pickup_zone,
-            COUNT(*) AS trips,
-            SUM("{total_col}") AS revenue
-        FROM trips
-        WHERE {date_filter}
-        GROUP BY 1
-        ORDER BY trips DESC
-        LIMIT 10
-        """,
-        params
-    ).df()
-
-    if not zone_data.empty:
-
-        fig = px.bar(
-            zone_data.sort_values("trips"),
-            x="trips",
-            y="pickup_zone",
-            orientation="h",
-            text="trips",
-            title="Top 10 Pickup Zones by Trip Count",
-            labels={
-                "trips": "Number of Trips",
-                "pickup_zone": "Pickup Zone ID"
-            },
-            template="plotly_white"
-        )
-
-        fig.update_traces(
-            textposition="outside"
-        )
-
-        st.plotly_chart(
-            fig,
-            width="stretch"
-        )
-
-        st.markdown("**Pickup Location Details**")
-
-        st.dataframe(
-            zone_data,
-            width="stretch",
-            hide_index=True
-        )
-
-else:
-    st.info("Pickup location column is unavailable.")
-
-
-st.divider()
-
-
-
-# 8. REVENUE BREAKDOWN - DONUT CHART
-
-st.subheader("🍩 Revenue Breakdown")
-
-revenue_columns = [
-    column for column in [
-        "fare_amount",
-        "tolls_amount",
-        "extra_amount",
-        "mta_tax",
-        "improvement_surcharge",
-        "congestion_surcharge",
-        "airport_fee",
-        "cbd_congestion_fee"
-    ]
-    if column in available_columns
-]
-
-
-if revenue_columns:
-
-    revenue_sql = ", ".join(
-        f'SUM("{column}") AS "{column}"'
-        for column in revenue_columns
-    )
-
-    revenue_data = con.execute(
-        f"""
-        SELECT {revenue_sql}
-        FROM trips
-        WHERE {date_filter}
-        """,
-        params
-    ).df()
-
-    revenue_long = revenue_data.melt(
-        var_name="Revenue Type",
-        value_name="Amount"
-    )
-
-    revenue_long = revenue_long.dropna()
-
-    revenue_long = revenue_long[
-        revenue_long["Amount"] > 0
-    ]
-
-    if not revenue_long.empty:
-
-        fig = px.pie(
-            revenue_long,
-            names="Revenue Type",
-            values="Amount",
-            hole=0.45,
-            title="Revenue Components",
-            template="plotly_white"
-        )
-
-        st.plotly_chart(
-            fig,
-            width="stretch"
-        )
-
-else:
-    st.info("Revenue component columns are unavailable.")
-
-
-st.divider()
-
-
-
-# 9. DAILY TRIP ACTIVITY - AREA CHART
-
-st.subheader("📉 Daily Trip Activity")
-
-daily = con.execute(
-    f"""
-    SELECT
-        CAST("{pickup_date_col}" AS DATE) AS trip_date,
-        COUNT(*) AS trips
-    FROM trips
-    WHERE {date_filter}
-    GROUP BY 1
-    ORDER BY 1
-    """,
-    params
-).df()
-
-
-if not daily.empty:
-
-    fig = px.area(
-        daily,
-        x="trip_date",
-        y="trips",
-        title="Daily Trip Volume",
-        labels={
-            "trip_date": "Date",
-            "trips": "Number of Trips"
-        },
-        template="plotly_white"
-    )
-
-    st.plotly_chart(
-        fig,
-        width="stretch"
-    )
-
-
-st.divider()
-
-
-
-# 10. TOP 10 DROP-OFF LOCATIONS
-
-
-st.subheader("📍 Top 10 Drop-off Locations")
-
-if dropoff_zone_col:
-
-    dropoff = con.execute(
-        f"""
-        SELECT
-            "{dropoff_zone_col}" AS dropoff_zone,
-            COUNT(*) AS trips,
-            SUM("{total_col}") AS revenue
-        FROM trips
-        WHERE {date_filter}
-        GROUP BY 1
-        ORDER BY trips DESC
-        LIMIT 10
-        """,
-        params
-    ).df()
-
-    st.dataframe(
-        dropoff,
-        width="stretch",
-        hide_index=True
-    )
-
-else:
-    st.info("Drop-off location column is unavailable.")
-
-
-st.divider()
-
-
-# 11. COMPLETE TRIP DATA TABLE
-
-
-st.subheader("📋 Trip Records")
-
-preview = con.execute(
-    f"""
-    SELECT *
-    FROM trips
-    WHERE {date_filter}
-    LIMIT 100
-    """,
-    params
-).df()
-
-
-st.caption("Showing up to 100 actual trip records")
+st.plotly_chart(fig, width="stretch")
 
 st.dataframe(
-    preview,
+    summary,
     width="stretch",
-    height=400,
     hide_index=True
 )
 
 
+# =========================================================
+# 11. MONTHLY TRIP DEMAND
+# =========================================================
 
-# 12. DOWNLOAD CSV REPORT
+st.markdown("---")
+st.subheader("📅 Monthly Trip Demand - January to December 2025")
 
-csv_data = preview.to_csv(
-    index=False
-).encode("utf-8")
+monthly = query_df(
+    f"""
+    SELECT
+        STRFTIME(
+            CAST(tpep_pickup_datetime AS TIMESTAMP),
+            '%Y-%m'
+        ) AS month,
+        trip_category,
+        COUNT(*) AS total_trips,
+        ROUND(COALESCE(SUM(revenue), 0), 2) AS total_revenue
+    FROM trips
+    WHERE {where_clause}
+    GROUP BY
+        STRFTIME(
+            CAST(tpep_pickup_datetime AS TIMESTAMP),
+            '%Y-%m'
+        ),
+        trip_category
+    ORDER BY month, trip_category
+    """,
+    params
+)
+
+if not monthly.empty:
+    fig = px.line(
+        monthly,
+        x="month",
+        y="total_trips",
+        color="trip_category",
+        markers=True,
+        title="Monthly Trips - Airport vs Non-Airport"
+    )
+
+    st.plotly_chart(fig, width="stretch")
+
+    st.dataframe(
+        monthly,
+        width="stretch",
+        hide_index=True
+    )
+else:
+    st.info("No monthly data available.")
+
+
+# =========================================================
+# 12. MONTHLY REVENUE
+# =========================================================
+
+st.subheader("💰 Monthly Revenue Analysis")
+
+if not monthly.empty:
+    fig = px.bar(
+        monthly,
+        x="month",
+        y="total_revenue",
+        color="trip_category",
+        barmode="group",
+        title="Monthly Revenue - Airport vs Non-Airport"
+    )
+
+    st.plotly_chart(fig, width="stretch")
+
+
+# =========================================================
+# 13. HOURLY DEMAND
+# =========================================================
+
+st.markdown("---")
+st.subheader("🕒 Hourly Trip Demand")
+
+hourly = query_df(
+    f"""
+    SELECT
+        EXTRACT(
+            HOUR FROM CAST(tpep_pickup_datetime AS TIMESTAMP)
+        ) AS pickup_hour,
+        trip_category,
+        COUNT(*) AS total_trips
+    FROM trips
+    WHERE {where_clause}
+    GROUP BY
+        EXTRACT(
+            HOUR FROM CAST(tpep_pickup_datetime AS TIMESTAMP)
+        ),
+        trip_category
+    ORDER BY pickup_hour, trip_category
+    """,
+    params
+)
+
+if not hourly.empty:
+    hourly["pickup_hour"] = hourly["pickup_hour"].astype(int)
+
+    fig = px.line(
+        hourly,
+        x="pickup_hour",
+        y="total_trips",
+        color="trip_category",
+        markers=True,
+        title="Trips by Hour - Airport vs Non-Airport"
+    )
+
+    fig.update_xaxes(dtick=1)
+
+    st.plotly_chart(fig, width="stretch")
+    st.dataframe(hourly, width="stretch", hide_index=True)
+
+
+# =========================================================
+# 14. WEEKDAY DEMAND
+# =========================================================
+
+st.markdown("---")
+st.subheader("📆 Weekday Demand Analysis")
+
+weekday = query_df(
+    f"""
+    SELECT
+        DAYNAME(
+            CAST(tpep_pickup_datetime AS TIMESTAMP)
+        ) AS weekday,
+        DAYOFWEEK(
+            CAST(tpep_pickup_datetime AS TIMESTAMP)
+        ) AS weekday_number,
+        trip_category,
+        COUNT(*) AS total_trips
+    FROM trips
+    WHERE {where_clause}
+    GROUP BY
+        DAYNAME(
+            CAST(tpep_pickup_datetime AS TIMESTAMP)
+        ),
+        DAYOFWEEK(
+            CAST(tpep_pickup_datetime AS TIMESTAMP)
+        ),
+        trip_category
+    ORDER BY weekday_number, trip_category
+    """,
+    params
+)
+
+if not weekday.empty:
+    fig = px.bar(
+        weekday,
+        x="weekday",
+        y="total_trips",
+        color="trip_category",
+        barmode="group",
+        title="Weekday Trips - Airport vs Non-Airport"
+    )
+
+    st.plotly_chart(fig, width="stretch")
+    st.dataframe(weekday, width="stretch", hide_index=True)
+
+
+# =========================================================
+# 15. TRIP DURATION ANALYSIS
+# =========================================================
+
+st.markdown("---")
+st.subheader("⏱️ Trip Duration Analysis")
+
+duration = query_df(
+    f"""
+    SELECT
+        trip_category,
+        ROUND(AVG(duration_minutes), 2) AS average_duration,
+        ROUND(MIN(duration_minutes), 2) AS minimum_duration,
+        ROUND(MAX(duration_minutes), 2) AS maximum_duration
+    FROM trips
+    WHERE {where_clause}
+      AND duration_minutes IS NOT NULL
+    GROUP BY trip_category
+    """,
+    params
+)
+
+if not duration.empty:
+    fig = px.bar(
+        duration,
+        x="trip_category",
+        y="average_duration",
+        color="trip_category",
+        title="Average Trip Duration",
+        text="average_duration"
+    )
+
+    st.plotly_chart(fig, width="stretch")
+    st.dataframe(duration, width="stretch", hide_index=True)
+
+
+# =========================================================
+# 16. PRODUCTIVITY PROXY
+# =========================================================
+
+st.markdown("---")
+st.subheader("🚕 Distance per Hour - Productivity Proxy")
+
+if "distance_per_hour" in columns:
+    productivity = query_df(
+        f"""
+        SELECT
+            trip_category,
+            ROUND(AVG(distance_per_hour), 2)
+                AS average_distance_per_hour
+        FROM trips
+        WHERE {where_clause}
+          AND distance_per_hour IS NOT NULL
+        GROUP BY trip_category
+        """,
+        params
+    )
+
+    if not productivity.empty:
+        fig = px.bar(
+            productivity,
+            x="trip_category",
+            y="average_distance_per_hour",
+            color="trip_category",
+            title="Average Distance per Hour"
+        )
+
+        st.plotly_chart(fig, width="stretch")
+        st.dataframe(productivity, width="stretch", hide_index=True)
+else:
+    st.info("distance_per_hour column is not available.")
+
+st.caption(
+    "Note: Distance per hour is a productivity proxy, "
+    "not actual vehicle utilization."
+)
+
+
+# =========================================================
+# 17. TOP PICKUP ZONES
+# =========================================================
+
+st.markdown("---")
+st.subheader("📍 Top 10 Pickup Zones")
+
+if "PULocationID" in columns:
+    top_zones = query_df(
+        f"""
+        SELECT
+            PULocationID,
+            trip_category,
+            COUNT(*) AS total_trips,
+            ROUND(COALESCE(SUM(revenue), 0), 2) AS total_revenue
+        FROM trips
+        WHERE {where_clause}
+        GROUP BY PULocationID, trip_category
+        ORDER BY total_trips DESC
+        LIMIT 10
+        """,
+        params
+    )
+
+    if not top_zones.empty:
+        fig = px.bar(
+            top_zones,
+            x="PULocationID",
+            y="total_trips",
+            color="trip_category",
+            barmode="group",
+            title="Top Pickup Zones"
+        )
+
+        st.plotly_chart(fig, width="stretch")
+        st.dataframe(top_zones, width="stretch", hide_index=True)
+else:
+    st.info("PULocationID column is not available.")
+
+
+# =========================================================
+# 18. REVENUE COMPONENTS
+# =========================================================
+
+st.markdown("---")
+st.subheader("💵 Revenue Components")
+
+revenue_columns = [
+    "fare_amount",
+    "tip_amount",
+    "tolls_amount",
+    "extra",
+    "mta_tax",
+    "improvement_surcharge",
+    "congestion_surcharge",
+    "airport_fee"
+]
+
+available_revenue_columns = [
+    col for col in revenue_columns if col in columns
+]
+
+if available_revenue_columns:
+    component_sql = ", ".join(
+        [
+            f"ROUND(COALESCE(SUM({col}), 0), 2) AS {col}"
+            for col in available_revenue_columns
+        ]
+    )
+
+    revenue_components = query_df(
+        f"""
+        SELECT
+            trip_category,
+            {component_sql}
+        FROM trips
+        WHERE {where_clause}
+        GROUP BY trip_category
+        """,
+        params
+    )
+
+    st.dataframe(
+        revenue_components,
+        width="stretch",
+        hide_index=True
+    )
+else:
+    st.info("No revenue component columns available.")
+
+
+# =========================================================
+# 19. AIRPORT ZONE MAPPING
+# =========================================================
+
+st.markdown("---")
+st.subheader("✈️ Airport Zone Mapping")
+
+mapping_exists = con.execute("""
+    SELECT COUNT(*)
+    FROM information_schema.tables
+    WHERE table_name = 'airport_zone_mapping'
+""").fetchone()[0]
+
+if mapping_exists:
+    mapping_result = query_df("""
+        SELECT zone_id, airport_name
+        FROM airport_zone_mapping
+        ORDER BY zone_id
+    """)
+
+    st.dataframe(
+        mapping_result,
+        width="stretch",
+        hide_index=True
+    )
+else:
+    st.info("Airport mapping table is not available.")
+
+st.caption(
+    "Airport Trip = pickup OR drop-off zone belongs to "
+    "zone IDs 1, 132 or 138."
+)
+
+
+# =========================================================
+# 20. TRIP DATA EXPLORER
+# =========================================================
+
+st.markdown("---")
+st.subheader("🔎 Trip Data Explorer")
+
+preview = query_df(
+    f"""
+    SELECT *
+    FROM trips
+    WHERE {where_clause}
+    LIMIT 1000
+    """,
+    params
+)
+
+st.write(
+    f"Showing up to 1,000 records. "
+    f"Total filtered trips: {total_trips:,}"
+)
+
+st.dataframe(
+    preview,
+    width="stretch",
+    height=400
+)
+
+csv_data = preview.to_csv(index=False).encode("utf-8")
 
 st.download_button(
-    label="⬇️ Download Trip Records CSV",
+    label="⬇️ Download Trip Data CSV",
     data=csv_data,
-    file_name="fleetsense_trip_report.csv",
+    file_name="fleetsense_2025_trip_data.csv",
     mime="text/csv"
 )
 
 
+# =========================================================
+# 21. FOOTER
+# =========================================================
 
-# 13. FOOTER
+st.markdown("---")
 
-st.divider()
+st.markdown("""
+**FleetSense 2025 Analytics Dashboard**
 
-st.caption(
-    "Data source: NYC Taxi & Limousine Commission (TLC) "
-    "2025 Yellow Taxi Trip Records."
-)
-
-st.success("FleetSense dashboard execution completed.")
+Full-year NYC Yellow Taxi analysis  
+Airport zones: 1, 132 and 138  
+Categories: Airport Trip and Non-Airport Trip
+""")
